@@ -1,0 +1,233 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation Template for Event-Driven Order Notification System'
+
+Resources:
+  # Step 1: DynamoDB Table
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Orders
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-OrdersTable"
+
+  # Step 2: SNS Topic
+  OrderTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: OrderTopic
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-OrderTopic"
+
+  # Step 3: Dead Letter Queue
+  OrderDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: OrderDeadLetterQueue
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-OrderDeadLetterQueue"
+
+  # Step 3: SQS Queue
+  OrderQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: OrderQueue
+      VisibilityTimeout: 30
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrderDeadLetterQueue.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-OrderQueue"
+
+  # Subscribe SQS to SNS
+  OrderQueueSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref OrderTopic
+      Protocol: sqs
+      Endpoint: !GetAtt OrderQueue.Arn
+
+  # SQS Queue Policy to allow SNS to publish messages
+  OrderQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref OrderQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: 
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt OrderQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref OrderTopic
+
+  # Step 4: Lambda Execution Role
+  OrderProcessorLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: OrderProcessorLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt OrdersTable.Arn
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt OrderQueue.Arn
+
+  # Step 4: Lambda Function
+  OrderProcessorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: OrderProcessor
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt OrderProcessorLambdaRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          from datetime import datetime
+
+          # Set up logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize AWS clients
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table('Orders')
+
+          def lambda_handler(event, context):
+              logger.info("Received event: " + json.dumps(event))
+              
+              for record in event['Records']:
+                  # Parse message from SQS
+                  message_body = record['body']
+                  logger.info(f"Processing message: {message_body}")
+                  
+                  try:
+                      # Parse the SNS message within SQS
+                      message_json = json.loads(message_body)
+                      # If the message comes from SNS, it will have a 'Message' field
+                      if 'Message' in message_json:
+                          order_data = json.loads(message_json['Message'])
+                      else:
+                          order_data = message_json
+                      
+                      # Log order details
+                      logger.info(f"Order data extracted: {json.dumps(order_data)}")
+                      
+                      # Store in DynamoDB
+                      store_order(order_data)
+                      
+                      logger.info(f"Successfully processed order {order_data.get('orderId', 'unknown')}")
+                  
+                  except Exception as e:
+                      logger.error(f"Error processing message: {str(e)}")
+                      # This will make the message visible again if not deleted
+                      raise e
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Order processing completed successfully')
+              }
+
+          def store_order(order_data):
+              try:
+                  # Ensure order data has all required fields
+                  if 'orderId' not in order_data:
+                      raise ValueError("Order data must contain orderId")
+                  
+                  # Set timestamp if not present
+                  if 'timestamp' not in order_data:
+                      order_data['timestamp'] = datetime.utcnow().isoformat()
+                  
+                  # Store in DynamoDB
+                  table.put_item(Item=order_data)
+                  logger.info(f"Order {order_data['orderId']} saved to DynamoDB")
+                  
+              except Exception as e:
+                  logger.error(f"Error storing order in DynamoDB: {str(e)}")
+                  raise e
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-OrderProcessorLambda"
+
+  # Lambda Event Source Mapping (triggers Lambda from SQS)
+  OrderProcessorEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      Enabled: true
+      EventSourceArn: !GetAtt OrderQueue.Arn
+      FunctionName: !GetAtt OrderProcessorLambda.Arn
+
+Outputs:
+  OrdersTableName:
+    Description: Name of the DynamoDB Orders table
+    Value: !Ref OrdersTable
+    Export:
+      Name: !Sub "${AWS::StackName}-OrdersTableName"
+
+  OrderTopicArn:
+    Description: ARN of the SNS Order Topic
+    Value: !Ref OrderTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-OrderTopicArn"
+
+  OrderQueueUrl:
+    Description: URL of the SQS Order Queue
+    Value: !Ref OrderQueue
+    Export:
+      Name: !Sub "${AWS::StackName}-OrderQueueUrl"
+
+  OrderQueueArn:
+    Description: ARN of the SQS Order Queue
+    Value: !GetAtt OrderQueue.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-OrderQueueArn"
+  
+  OrderDeadLetterQueueUrl:
+    Description: URL of the SQS Dead Letter Queue
+    Value: !Ref OrderDeadLetterQueue
+    Export:
+      Name: !Sub "${AWS::StackName}-OrderDeadLetterQueueUrl"
+
+  OrderProcessorLambdaArn:
+    Description: ARN of the Order Processor Lambda
+    Value: !GetAtt OrderProcessorLambda.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-OrderProcessorLambdaArn"
